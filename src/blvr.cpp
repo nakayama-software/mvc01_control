@@ -1,4 +1,4 @@
-// joy_to_blvr.cpp
+// blvr.cpp
 #include <array>
 #include <cmath>
 #include <cstdint>
@@ -9,7 +9,7 @@
 
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp/qos.hpp"
-#include "sensor_msgs/msg/joy.hpp"
+#include "geometry_msgs/msg/twist.hpp"
 #include "sensor_msgs/msg/imu.hpp"
 #include "sensor_msgs/msg/temperature.hpp"
 #include "geometry_msgs/msg/quaternion.hpp"
@@ -46,13 +46,6 @@ static inline geometry_msgs::msg::Quaternion yaw_to_quat(double yaw)
     q.z = sy;
     q.w = cy;
     return q;
-}
-static inline double apply_deadzone(double x, double dz)
-{
-    if (std::fabs(x) < dz)
-        return 0.0;
-    double s = x >= 0.0 ? 1.0 : -1.0;
-    return s * ((std::fabs(x) - dz) / (1.0 - dz));
 }
 
 // ================= Modbus wrapper =================
@@ -115,8 +108,11 @@ public:
     {
         auto regs = i32_to_regs_be(val);
         int rc = modbus_write_registers(ctx_, addr, 2, regs.data());
-        if (rc != 2)
-            throw std::runtime_error("modbus_write_registers failed");
+        if (rc != 2) {
+            int err = errno;
+            std::string msg = modbus_strerror(err);
+            throw std::runtime_error("modbus_write_registers failed: " + msg);
+        }
     }
 
     int32_t read_i32(int addr)
@@ -144,10 +140,10 @@ private:
 };
 
 // ================= Node =================
-class JoyToBLVR : public rclcpp::Node
+class BLVR : public rclcpp::Node
 {
 public:
-    JoyToBLVR() : Node("joy_to_blvr")
+    BLVR() : Node("blvr")
     {
         // Params
         port_ = this->declare_parameter<std::string>("port", "/dev/ttyUSB0");
@@ -156,27 +152,17 @@ public:
         stopbits_ = this->declare_parameter<int>("stopbits", 1);
         slave_id_ = this->declare_parameter<int>("slave_id", 1);
         timeout_s_ = this->declare_parameter<double>("timeout_s", 2.0);
-        axis_lin_ = this->declare_parameter<int>("axis_linear", 1);
-        axis_ang_ = this->declare_parameter<int>("axis_angular", 0);
-        inv_lin_ = this->declare_parameter<bool>("invert_linear", false);
-        inv_ang_ = this->declare_parameter<bool>("invert_angular", false);
-        deadzone_ = this->declare_parameter<double>("deadzone", 0.08);
         lin_scale_ = this->declare_parameter<double>("linear_scale", 0.6);
         ang_scale_ = this->declare_parameter<double>("angular_scale", 2.5);
-        turbo_btn_ = this->declare_parameter<int>("turbo_button", -1);
-        turbo_mul_ = this->declare_parameter<double>("turbo_multiplier", 1.5);
-        enable_btn_ = this->declare_parameter<int>("enable_button", -1);
-        estop_btn_ = this->declare_parameter<int>("estop_button", -1);
-        cmd_rate_hz_ = std::max(5.0, this->declare_parameter<double>("cmd_rate_hz", 50.0));
-        poll_rate_hz_ = std::max(1.0, this->declare_parameter<double>("poll_rate_hz", 20.0));
-        joy_to_s_ = this->declare_parameter<double>("joy_timeout_s", 0.5);
         vx_limit_ = this->declare_parameter<double>("vx_limit", 0.5);
         w_limit_ = this->declare_parameter<double>("w_limit", 1.68);
+        cmd_rate_hz_ = std::max(5.0, this->declare_parameter<double>("cmd_rate_hz", 50.0));
+        poll_rate_hz_ = std::max(1.0, this->declare_parameter<double>("poll_rate_hz", 20.0));
         odom_frame_ = this->declare_parameter<std::string>("odom_frame", "odom");
         base_frame_ = this->declare_parameter<std::string>("base_frame", "base_link");
         imu_frame_ = this->declare_parameter<std::string>("imu_frame", "imu_link");
 
-        // Monitor register params (override via YAML jika berbeda)
+        // Monitor register params
         addr_disp_fb_ = this->declare_parameter<int>("addr_disp_fb", 2144);
         addr_disp_lr_ = this->declare_parameter<int>("addr_disp_lr", 2146);
         addr_wodo_x_ = this->declare_parameter<int>("addr_wodo_x", 2138);
@@ -213,12 +199,11 @@ public:
                                             stopbits_, slave_id_, timeout_s_);
         mb_->connect();
         RCLCPP_INFO(get_logger(), "Modbus open on %s", port_.c_str());
-        mb_->with_retry([&]
-                        { mb_->write_u32(ADDR_MODE, 1); return 0; }); // Vx-ω mode
+        mb_->with_retry([&] { mb_->write_u32(ADDR_MODE, 1); return 0; }); // Vx-ω mode
 
         // ROS IO
-        auto joy_qos = rclcpp::QoS(rclcpp::KeepLast(10)).best_effort().durability_volatile();
-        sub_ = this->create_subscription<sensor_msgs::msg::Joy>("/joy", joy_qos, std::bind(&JoyToBLVR::joy_cb, this, _1));
+        auto cmd_qos = rclcpp::QoS(rclcpp::KeepLast(10)).best_effort().durability_volatile();
+        sub_ = this->create_subscription<geometry_msgs::msg::Twist>("/cmd_vel", cmd_qos, std::bind(&BLVR::cmd_cb, this, _1));
 
         auto sensor_qos = rclcpp::SensorDataQoS();
         odom_wheel_pub_ = this->create_publisher<nav_msgs::msg::Odometry>("/odom_wheel", sensor_qos);
@@ -236,17 +221,15 @@ public:
 
         // Timers
         cmd_timer_ = this->create_wall_timer(std::chrono::milliseconds(static_cast<int>(1000.0 / cmd_rate_hz_)),
-                                             std::bind(&JoyToBLVR::cmd_loop, this));
+                                             std::bind(&BLVR::cmd_loop, this));
         poll_timer_ = this->create_wall_timer(std::chrono::milliseconds(static_cast<int>(1000.0 / poll_rate_hz_)),
-                                              std::bind(&JoyToBLVR::poll_loop, this));
+                                              std::bind(&BLVR::poll_loop, this));
 
-        last_joy_time_ = now();
-        enabled_ = (enable_btn_ < 0);
-        estop_latched_ = false;
-        RCLCPP_INFO(get_logger(), "joy_to_blvr ready");
+        last_cmd_time_ = now();
+        RCLCPP_INFO(get_logger(), "blvr ready");
     }
 
-    ~JoyToBLVR() override
+    ~BLVR() override
     {
         safe_stop();
         mb_.reset();
@@ -259,22 +242,12 @@ private:
     static constexpr int ADDR_W = 1990;  // 1e-6 rad/s
     static constexpr int ADDR_TRG = 2030;
 
-    // Joy callback
-    void joy_cb(const sensor_msgs::msg::Joy::SharedPtr msg)
+    // Cmd callback
+    void cmd_cb(const geometry_msgs::msg::Twist::SharedPtr msg)
     {
         std::lock_guard<std::mutex> lk(m_);
-        axes_ = msg->axes;
-        buttons_ = msg->buttons;
-        last_joy_time_ = now();
-        if (estop_btn_ >= 0 && estop_btn_ < (int)buttons_.size())
-            if (buttons_[estop_btn_] == 1)
-                estop_latched_ = true;
-        if (enable_btn_ >= 0 && enable_btn_ < (int)buttons_.size())
-        {
-            enabled_ = (buttons_[enable_btn_] == 1);
-            if (enabled_)
-                estop_latched_ = false;
-        }
+        last_cmd_ = *msg;
+        last_cmd_time_ = now();
     }
 
     // Command loop
@@ -285,41 +258,23 @@ private:
             double vx_cmd = 0.0, w_cmd = 0.0;
             {
                 std::lock_guard<std::mutex> lk(m_);
-                bool stale = (now() - last_joy_time_).seconds() > joy_to_s_;
-                if (enabled_ && !estop_latched_ && !stale)
+                bool stale = (now() - last_cmd_time_).seconds() > 0.5;
+                if (!stale)
                 {
-                    double ax_lin = (axis_lin_ < (int)axes_.size()) ? axes_[axis_lin_] : 0.0;
-                    double ax_ang = (axis_ang_ < (int)axes_.size()) ? axes_[axis_ang_] : 0.0;
-                    if (inv_lin_)
-                        ax_lin = -ax_lin;
-                    if (inv_ang_)
-                        ax_ang = -ax_ang;
-                    ax_lin = apply_deadzone(ax_lin, deadzone_);
-                    ax_ang = apply_deadzone(ax_ang, deadzone_);
-                    double mult = (turbo_btn_ >= 0 && turbo_btn_ < (int)buttons_.size() && buttons_[turbo_btn_] == 1) ? turbo_mul_ : 1.0;
-                    vx_cmd = std::clamp(ax_lin * lin_scale_ * mult, -vx_limit_, vx_limit_);
-                    w_cmd = std::clamp(ax_ang * ang_scale_ * mult, -w_limit_, w_limit_);
+                    vx_cmd = std::clamp(last_cmd_.linear.x, -vx_limit_, vx_limit_);
+                    w_cmd = std::clamp(last_cmd_.angular.z, -w_limit_, w_limit_);
                 }
             }
             int32_t vx_units = static_cast<int32_t>(std::llround(vx_cmd / 0.001));
             int32_t w_units = static_cast<int32_t>(std::llround(w_cmd / 1e-6));
-            mb_->with_retry([&]
-                            { mb_->write_u32(ADDR_VX,  vx_units); return 0; });
-            mb_->with_retry([&]
-                            { mb_->write_u32(ADDR_W,   w_units ); return 0; });
-            mb_->with_retry([&]
-                            { mb_->write_u32(ADDR_TRG, 1       ); return 0; });
+            mb_->with_retry([&] { mb_->write_u32(ADDR_VX, vx_units); return 0; });
+            mb_->with_retry([&] { mb_->write_u32(ADDR_W, w_units); return 0; });
+            mb_->with_retry([&] { mb_->write_u32(ADDR_TRG, 1); return 0; });
         }
         catch (const std::exception &e)
         {
             RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 2000, "cmd error: %s", e.what());
-            try
-            {
-                safe_stop();
-            }
-            catch (...)
-            {
-            }
+            try { safe_stop(); } catch (...) {}
         }
     }
 
@@ -333,9 +288,8 @@ private:
             // Wheel odom block: 2138..2143 (6 regs)
             {
                 uint16_t r[6];
-                mb_->with_retry([&]
-                                { mb_->read_block(addr_wodo_x_, 6, r); return 0; });
-                double x = regs_to_m(r[0], r[1]); // 0.001 m
+                mb_->with_retry([&]{ mb_->read_block(addr_wodo_x_, 6, r); return 0; });
+                double x = regs_to_m(r[0], r[1]);
                 double y = regs_to_m(r[2], r[3]);
                 double th = regs_to_u6rad(r[4], r[5]);
                 nav_msgs::msg::Odometry ow;
@@ -348,14 +302,13 @@ private:
                 odom_wheel_pub_->publish(ow);
             }
 
-            // Gyro odom block: 2064..2071 (8 regs) -> x,y,(unused),yaw
+            // Gyro odom block: 2064..2071 (8 regs)
             {
                 uint16_t r[8];
-                mb_->with_retry([&]
-                                { mb_->read_block(addr_godo_x_, 8, r); return 0; });
+                mb_->with_retry([&]{ mb_->read_block(addr_godo_x_, 8, r); return 0; });
                 double x = regs_to_m(r[0], r[1]);
                 double y = regs_to_m(r[2], r[3]);
-                double yaw = regs_to_u6rad(r[6], r[7]); // 2070/2071
+                double yaw = regs_to_u6rad(r[6], r[7]);
                 nav_msgs::msg::Odometry og;
                 og.header.stamp = stamp;
                 og.header.frame_id = odom_frame_;
@@ -366,11 +319,10 @@ private:
                 odom_gyro_pub_->publish(og);
             }
 
-            // IMU block: 2084..2097 (14 regs) -> ax,ay,az,gx,gy,gz, temp
+            // IMU block
             {
                 uint16_t r[14];
-                mb_->with_retry([&]
-                                { mb_->read_block(addr_imu_ax_, 14, r); return 0; });
+                mb_->with_retry([&]{ mb_->read_block(addr_imu_ax_, 14, r); return 0; });
                 sensor_msgs::msg::Imu imu;
                 imu.header.stamp = stamp;
                 imu.header.frame_id = imu_frame_;
@@ -467,14 +419,7 @@ private:
         catch (const std::exception &e)
         {
             RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "poll error: %s (retry)", e.what());
-            try
-            {
-                mb_->connect();
-            }
-            catch (...)
-            {
-                RCLCPP_ERROR(get_logger(), "modbus reconnect failed");
-            }
+            try { mb_->connect(); } catch (...) { RCLCPP_ERROR(get_logger(), "modbus reconnect failed"); }
         }
     }
 
@@ -497,38 +442,15 @@ private:
     {
         if (!mb_ || !mb_->ok())
             return;
-        try
-        {
-            mb_->with_retry([&]
-                            { mb_->write_u32(ADDR_VX,0); return 0; });
-        }
-        catch (...)
-        {
-        }
-        try
-        {
-            mb_->with_retry([&]
-                            { mb_->write_u32(ADDR_W, 0); return 0; });
-        }
-        catch (...)
-        {
-        }
-        try
-        {
-            mb_->with_retry([&]
-                            { mb_->write_u32(ADDR_TRG,1); return 0; });
-        }
-        catch (...)
-        {
-        }
+        try { mb_->with_retry([&]{ mb_->write_u32(ADDR_VX,0); return 0; }); } catch (...) {}
+        try { mb_->with_retry([&]{ mb_->write_u32(ADDR_W, 0); return 0; }); } catch (...) {}
+        try { mb_->with_retry([&]{ mb_->write_u32(ADDR_TRG,1); return 0; }); } catch (...) {}
     }
 
     // State
     std::mutex m_;
-    std::vector<float> axes_;
-    std::vector<int32_t> buttons_;
-    rclcpp::Time last_joy_time_;
-    bool enabled_{true}, estop_latched_{false};
+    geometry_msgs::msg::Twist last_cmd_;
+    rclcpp::Time last_cmd_time_;
 
     // Modbus
     std::unique_ptr<Mvc01Modbus> mb_;
@@ -536,11 +458,8 @@ private:
     // Params
     std::string port_, parity_s_;
     int baudrate_{230400}, stopbits_{1}, slave_id_{1};
-    double timeout_s_{2.0}, cmd_rate_hz_{50.0}, poll_rate_hz_{20.0}, joy_to_s_{0.5};
-    double lin_scale_{0.6}, ang_scale_{2.5}, turbo_mul_{1.5}, vx_limit_{2.0}, w_limit_{6.283186};
-    int axis_lin_{1}, axis_ang_{0}, turbo_btn_{-1}, enable_btn_{-1}, estop_btn_{-1};
-    bool inv_lin_{false}, inv_ang_{false};
-    double deadzone_{0.08};
+    double timeout_s_{2.0}, cmd_rate_hz_{50.0}, poll_rate_hz_{20.0};
+    double lin_scale_{0.6}, ang_scale_{2.5}, vx_limit_{0.5}, w_limit_{1.68};
     std::string odom_frame_{"odom"}, base_frame_{"base_link"}, imu_frame_{"imu_link"};
 
     // Monitor addresses
@@ -554,7 +473,7 @@ private:
     double torque_scale_;
 
     // ROS IO
-    rclcpp::Subscription<sensor_msgs::msg::Joy>::SharedPtr sub_;
+    rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr sub_;
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_wheel_pub_, odom_gyro_pub_;
     rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr imu_pub_;
     rclcpp::Publisher<sensor_msgs::msg::Temperature>::SharedPtr imu_temp_pub_, ctl_temp_pub_;
@@ -570,7 +489,7 @@ private:
 int main(int argc, char **argv)
 {
     rclcpp::init(argc, argv);
-    rclcpp::spin(std::make_shared<JoyToBLVR>());
+    rclcpp::spin(std::make_shared<BLVR>());
     rclcpp::shutdown();
     return 0;
 }
