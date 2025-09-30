@@ -16,7 +16,7 @@ find_package(std_msgs REQUIRED)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(LIBMODBUS REQUIRED libmodbus)
 
-# Existing joystick-to-BLVR node
+# === joy_to_blvr node ===
 add_executable(joy_to_blvr src/joy_to_blvr.cpp)
 target_compile_features(joy_to_blvr PUBLIC cxx_std_17)
 target_include_directories(joy_to_blvr PUBLIC ${LIBMODBUS_INCLUDE_DIRS})
@@ -30,7 +30,22 @@ ament_target_dependencies(joy_to_blvr
   std_msgs
 )
 
-# New cmd_vel-to-BLVR node
+# === cmdvel_to_blvr node ===
+add_executable(cmdvel_to_blvr src/cmdvel_to_blvr.cpp)
+target_compile_features(cmdvel_to_blvr PUBLIC cxx_std_17)
+target_include_directories(cmdvel_to_blvr PUBLIC ${LIBMODBUS_INCLUDE_DIRS})
+link_directories(${LIBMODBUS_LIBRARY_DIRS})
+target_link_libraries(cmdvel_to_blvr ${LIBMODBUS_LIBRARIES})
+ament_target_dependencies(cmdvel_to_blvr
+  rclcpp
+  geometry_msgs
+  sensor_msgs
+  nav_msgs
+  std_msgs
+)
+
+
+# === blvr node ===
 add_executable(blvr src/blvr.cpp)
 target_compile_features(blvr PUBLIC cxx_std_17)
 target_include_directories(blvr PUBLIC ${LIBMODBUS_INCLUDE_DIRS})
@@ -44,8 +59,11 @@ ament_target_dependencies(blvr
   std_msgs
 )
 
-# Install both
-install(TARGETS joy_to_blvr blvr
+# === Install all executables ===
+install(TARGETS
+  joy_to_blvr
+  cmdvel_to_blvr
+  blvr
   DESTINATION lib/${PROJECT_NAME}
 )
 
